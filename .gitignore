@@ -1,13 +1,13 @@
 
 # Python virtual environment
-.venv/
+.venv*/
 venv/
 
 # Python cache
 __pycache__/
 *.py[cod]
 
-# Firebase credentials - KEEP SECRET
+# Firebase credentials
 firebase-admin-key.json
 *serviceAccount*.json
 *-firebase-adminsdk-*.json
@@ -18,7 +18,7 @@ firebase-admin-key.json
 .env
 .env.*
 
-# VS Code and OS
+# Editor and OS
 .vscode/
 .DS_Store
 Thumbs.db
