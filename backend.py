@@ -1,24 +1,32 @@
 """Backend lokal Smart Traffic Light Rawamangun - Kelompok 12.
 
 Alur:
-Android GPS -> Firebase /ambulance/sessions/{uid}
-    -> Python Backend memantau GPS
-    -> Firebase /commands/{request_id}
-    -> Serial JSONL -> ESP32
+    Android Virtual GPS
+        -> Firebase /ambulance/sessions/{uid}
+        -> Python Backend memantau sesi dan umur GPS
+        -> Firebase /commands/{request_id}
+        -> Serial JSONL
+        -> ESP32
 
-Saat GPS tiba / sesi selesai / GPS stale:
-Python -> RELEASE -> ESP32 mengakhiri GREEN HOLD dengan kuning + all-red.
+PRIORITY dibuat ketika:
+    - simulation.status == running
+    - live.status == MOVING
+    - timestamp GPS valid dan segar
+    - distance_remaining_m <= 150 meter
 
-Perintah serial: PING, STATUS, PRIORITY, RELEASE.
+RELEASE dibuat ketika sesi yang sudah meminta PRIORITY:
+    - live.status == ARRIVED
+    - sesi dibatalkan
+    - sesi selesai/dihentikan secara manual
+    - GPS stale
+    - timestamp GPS tidak valid (terlalu jauh di masa depan)
 
-Catatan:
-- Satu permintaan PRIORITY otomatis dibuat per sesi simulasi.
-- Pemicu: simulation.status=running, live.status=MOVING,
-  data GPS maksimal 5 detik, jarak tersisa <= 150 meter.
-- RELEASE dikirim ketika ARRIVED, sesi selesai/dibatalkan,
-  atau data GPS stale lebih dari 5 detik.
-- Firmware ESP32 juga memiliki failsafe GREEN HOLD maksimum 90 detik.
-- Prototipe ini untuk miniatur, bukan pengendali jalan umum.
+Umur GPS ditampilkan sebagai selisih bertanda (bisa negatif).
+Selisih kecil akibat perbedaan jam ditoleransi untuk keputusan prioritas,
+namun tidak diubah menjadi nol pada log agar dapat diamati.
+
+Firmware ESP32 memiliki failsafe GREEN HOLD maksimum 90 detik.
+Prototipe ini untuk miniatur, bukan pengendali jalan umum.
 """
 
 from __future__ import annotations
@@ -27,8 +35,8 @@ import json
 import math
 import queue
 import re
-import time
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,7 +74,13 @@ AMBULANCE_SCAN_INTERVAL_SECONDS = 1.0
 MAX_GPS_DATA_AGE_SECONDS = 5.0
 PRIORITY_TRIGGER_DISTANCE_METERS = 150.0
 
-# Pemetaan TL ke kelompok lampu ESP32.
+# Toleransi perbedaan jam Windows terhadap waktu server Firebase.
+# Umur antara -5 dan 0 detik tetap ditampilkan sebagai angka negatif,
+# tetapi masih dianggap dapat diterima untuk pemantauan.
+# Timestamp lebih maju dari batas ini dianggap tidak valid.
+MAX_FUTURE_CLOCK_SKEW_SECONDS = 5.0
+
+# Pemetaan traffic light ke kelompok lampu ESP32.
 TRAFFIC_LIGHT_TO_GROUP = {
     "TL1": "A",
     "TL2": "A",
@@ -85,6 +99,14 @@ ALLOWED_COMMANDS = {
 VALID_PRIORITY_GROUPS = {"A", "B", "C"}
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
+RELEASE_LOG_TITLES = {
+    "AMBULANCE_ARRIVED": "AMBULANS TIBA DI TUJUAN",
+    "SESSION_CANCELLED": "SIMULASI AMBULANS DIBATALKAN",
+    "SESSION_ENDED": "SESI SIMULASI BERAKHIR",
+    "GPS_STALE": "GPS TIDAK SEGAR",
+    "GPS_TIMESTAMP_INVALID": "TIMESTAMP GPS TIDAK VALID",
+}
+
 
 # ============================================================
 # ANTRIAN PERINTAH FIREBASE
@@ -96,6 +118,7 @@ queued_ids_lock = threading.Lock()
 
 
 def utc_now_iso() -> str:
+    """Waktu UTC untuk metadata/log Firebase yang berbentuk ISO-8601."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -104,8 +127,7 @@ def log(message: str) -> None:
 
 
 def enqueue_command(request_id: str, payload: Any) -> None:
-    """Masukkan perintah pending ke antrean, satu kali per ID."""
-
+    """Masukkan perintah pending ke antrean lokal, satu kali per ID."""
     if not REQUEST_ID_PATTERN.fullmatch(request_id):
         log(f"[FIREBASE] Abaikan request_id tidak valid: {request_id!r}")
         return
@@ -116,7 +138,7 @@ def enqueue_command(request_id: str, payload: Any) -> None:
     if str(payload.get("status", "")).lower() != "pending":
         return
 
-    # Callback Firebase berjalan di background; main thread yang memakai serial.
+    # Callback Firebase berjalan di background; hanya main thread memakai serial.
     with queued_ids_lock:
         if request_id in queued_request_ids:
             return
@@ -128,7 +150,6 @@ def enqueue_command(request_id: str, payload: Any) -> None:
 
 def firebase_commands_callback(event: Any) -> None:
     """Terima perubahan pada Firebase /commands."""
-
     try:
         event_path = getattr(event, "path", "/") or "/"
         event_data = getattr(event, "data", None)
@@ -157,7 +178,6 @@ def publish_esp32_status(
     response: dict[str, Any],
 ) -> None:
     """Simpan status ESP32, termasuk status prioritas bila tersedia."""
-
     status_ref.update(
         {
             "online": True,
@@ -178,8 +198,7 @@ def update_session_simulation(
     uid: Any,
     **fields: Any,
 ) -> None:
-    """Update metadata prioritas pada sesi Android."""
-
+    """Update metadata prioritas pada /ambulance/sessions/{uid}/simulation."""
     if not uid:
         return
 
@@ -189,16 +208,34 @@ def update_session_simulation(
         log(f"[GPS] Gagal memperbarui sesi {uid}: {error}")
 
 
-def parse_gps_age_seconds(live: dict[str, Any], now_ms: float) -> float | None:
+def parse_gps_age_seconds(
+    live: dict[str, Any],
+    now_ms: float,
+) -> float | None:
+    """Hitung dan kembalikan umur GPS aktual dalam detik.
+
+    Firebase ServerValue.TIMESTAMP menghasilkan epoch-milliseconds.
+    Umur negatif tidak dinormalisasi menjadi 0 karena berguna untuk
+    melihat perbedaan jam komputer terhadap waktu server Firebase.
+    Nilai negatif yang lebih besar daripada toleransi masa depan akan
+    ditolak oleh monitor_ambulance_sessions().
+    """
     try:
-        updated_at_ms = float(live.get("updated_at"))
+        raw_updated_at = live.get("updated_at")
+        if isinstance(raw_updated_at, bool):
+            return None
+        updated_at_ms = float(raw_updated_at)
     except (TypeError, ValueError):
         return None
 
-    age = (now_ms - updated_at_ms) / 1000.0
-    if not math.isfinite(age):
+    if not math.isfinite(updated_at_ms):
         return None
-    return age
+
+    age_seconds = (now_ms - updated_at_ms) / 1000.0
+    if not math.isfinite(age_seconds):
+        return None
+
+    return age_seconds
 
 
 def create_release_command(
@@ -209,15 +246,12 @@ def create_release_command(
     group: str,
     reason: str,
 ) -> None:
-    """Buat RELEASE satu kali untuk sesi yang sebelumnya meminta prioritas."""
-
+    """Buat satu perintah RELEASE untuk sesi yang sudah meminta PRIORITY."""
     started_at = simulation.get("started_at")
     if started_at is None:
         return
 
-    already_released_for = simulation.get(
-        "priority_release_for_started_at"
-    )
+    already_released_for = simulation.get("priority_release_for_started_at")
     if (
         already_released_for is not None
         and str(already_released_for) == str(started_at)
@@ -237,7 +271,7 @@ def create_release_command(
     }
 
     try:
-        # Simpan command dan tandai sesi agar scan berikutnya tidak duplikat.
+        # Buat command, lalu tandai started_at agar tidak dibuat duplikat.
         commands_ref.child(release_request_id).set(release_data)
         update_session_simulation(
             sessions_ref,
@@ -249,11 +283,12 @@ def create_release_command(
             priority_release_requested_at=utc_now_iso(),
         )
 
-        # Enqueue lokal; event listener yang sama akan terdeduplikasi.
+        # Enqueue lokal; event listener akan terdeduplikasi berdasarkan ID.
         enqueue_command(release_request_id, release_data)
 
+        title = RELEASE_LOG_TITLES.get(reason, "RELEASE DIPERLUKAN")
         log("=" * 58)
-        log("[GPS] AMBULANS SELESAI / GPS TIDAK SEGAR")
+        log(f"[GPS] {title}")
         log(f"[GPS] UID                : {uid}")
         log(f"[GPS] Kelompok           : {group}")
         log(f"[GPS] Alasan RELEASE     : {reason}")
@@ -269,19 +304,21 @@ def monitor_ambulance_sessions(
     sessions_ref: Any,
     commands_ref: Any,
 ) -> None:
-    """Pantau GPS, buat PRIORITY, lalu RELEASE ketika sesi berakhir.
+    """Pantau sesi ambulans dan buat PRIORITY/RELEASE sesuai status.
 
     PRIORITY:
-      simulation.status=running
-      live.status=MOVING
-      GPS segar <= 5 detik
-      distance_remaining_m <= 150 meter
+        simulation.status=running
+        live.status=MOVING
+        GPS segar dan timestamp tidak terlalu maju
+        distance_remaining_m <= 150 meter
 
-    RELEASE:
-      live.status=ARRIVED, atau simulation selesai/dibatalkan,
-      atau GPS menjadi stale setelah sesi pernah meminta prioritas.
+    RELEASE, jika sesi sudah meminta PRIORITY:
+        live.status=ARRIVED
+        atau sesi dibatalkan
+        atau sesi diselesaikan/dihentikan manual
+        atau GPS stale
+        atau timestamp GPS terlalu jauh di masa depan
     """
-
     try:
         sessions = sessions_ref.get()
     except Exception as error:
@@ -315,21 +352,19 @@ def monitor_ambulance_sessions(
             continue
 
         age_seconds = parse_gps_age_seconds(live, now_ms)
-        request_marker = simulation.get(
-            "priority_requested_for_started_at"
-        )
+        request_marker = simulation.get("priority_requested_for_started_at")
         request_matches_session = (
             request_marker is not None
             and str(request_marker) == str(started_at)
         )
 
         # ----------------------------------------------------
-        # 1. Jika sesi ini sudah meminta PRIORITY, cek RELEASE.
+        # 1. Sesi ini sudah meminta PRIORITY: evaluasi RELEASE.
         # ----------------------------------------------------
         if request_matches_session:
-            # Hanya sesi yang dibuat oleh versi GREEN HOLD ini yang
-            # boleh memicu RELEASE otomatis. Ini menghindari sesi lama
-            # dari pengujian PRIORITY sebelumnya melepas prioritas baru.
+            # Hanya sesi yang dibuat oleh versi GREEN HOLD ini yang boleh
+            # memicu RELEASE otomatis. Ini menghindari sesi lama dari tes
+            # PRIORITY sebelumnya melepas prioritas sesi baru.
             if simulation.get("priority_hold_version") != 1:
                 continue
 
@@ -343,22 +378,44 @@ def monitor_ambulance_sessions(
             if group not in VALID_PRIORITY_GROUPS:
                 continue
 
-            # Tidak perlu RELEASE jika PRIORITY sebelumnya ditolak/gagal.
+            # Tidak perlu RELEASE jika PRIORITY ditolak/gagal.
             if priority_status in {"rejected", "failed"}:
                 continue
 
             reason: str | None = None
-            if gps_status == "ARRIVED" or simulation_status in {
-                "completed", "complete", "finished"
-            }:
+
+            # Urutan ini penting: pembatalan harus dideteksi sebelum status
+            # sesi selesai umum. ARRIVED hanya jika live benar-benar ARRIVED.
+            if (
+                gps_status in {"CANCELLED", "CANCELED"}
+                or simulation_status in {"cancelled", "canceled"}
+            ):
+                reason = "SESSION_CANCELLED"
+
+            elif gps_status == "ARRIVED":
                 reason = "AMBULANCE_ARRIVED"
-            elif simulation_status in {
-                "cancelled", "canceled", "failed", "stopped"
-            }:
+
+            elif (
+                gps_status in {"FINISHED", "FAILED", "STOPPED"}
+                or simulation_status in {
+                    "completed",
+                    "complete",
+                    "finished",
+                    "failed",
+                    "stopped",
+                }
+            ):
+                # Status simulation=completed tanpa live=ARRIVED bukan
+                # bukti bahwa ambulans benar-benar sudah tiba.
                 reason = "SESSION_ENDED"
-            elif age_seconds is None or age_seconds > MAX_GPS_DATA_AGE_SECONDS:
+
+            elif age_seconds is None:
                 reason = "GPS_STALE"
-            elif age_seconds < -5.0:
+
+            elif age_seconds > MAX_GPS_DATA_AGE_SECONDS:
+                reason = "GPS_STALE"
+
+            elif age_seconds < -MAX_FUTURE_CLOCK_SKEW_SECONDS:
                 reason = "GPS_TIMESTAMP_INVALID"
 
             if reason is not None:
@@ -371,7 +428,7 @@ def monitor_ambulance_sessions(
                     reason=reason,
                 )
 
-            # Sesi ini sudah punya permintaan prioritas. Jangan trigger lagi.
+            # Sesi ini sudah punya request PRIORITY; jangan trigger lagi.
             continue
 
         # ----------------------------------------------------
@@ -380,17 +437,18 @@ def monitor_ambulance_sessions(
         if simulation_status != "running":
             continue
 
-        # Ambulans harus sedang bergerak.
         if gps_status != "MOVING":
             continue
 
-        # Data GPS harus segar.
+        # Data GPS harus mempunyai timestamp, segar, dan tidak terlalu maju.
         if age_seconds is None:
             continue
-        if age_seconds < -5.0 or age_seconds > MAX_GPS_DATA_AGE_SECONDS:
+        if age_seconds < -MAX_FUTURE_CLOCK_SKEW_SECONDS:
+            continue
+        if age_seconds > MAX_GPS_DATA_AGE_SECONDS:
             continue
 
-        # Validasi koordinat.
+        # Validasi koordinat dan jarak.
         try:
             latitude = float(live.get("latitude"))
             longitude = float(live.get("longitude"))
@@ -452,8 +510,8 @@ def monitor_ambulance_sessions(
                 priority_hold_version=1,
             )
 
-            # Event listener juga melihat node ini; enqueue_command mencegah
-            # request ID yang sama masuk dua kali ke antrian lokal.
+            # Listener Firebase juga melihat node ini; ID yang sama tidak
+            # akan masuk dua kali ke antrean lokal.
             enqueue_command(request_id, command_data)
 
             log("=" * 58)
@@ -464,7 +522,8 @@ def monitor_ambulance_sessions(
             log(f"[GPS] Latitude           : {latitude:.7f}")
             log(f"[GPS] Longitude          : {longitude:.7f}")
             log(f"[GPS] Jarak tersisa      : {distance_remaining:.2f} m")
-            log(f"[GPS] Umur data          : {age_seconds:.2f} detik")
+            # Tanda + / - dan tiga desimal memperlihatkan selisih waktu asli.
+            log(f"[GPS] Umur data          : {age_seconds:+.3f} detik")
             log(f"[GPS] Command ID         : {request_id}")
             log("[GPS] Perintah PRIORITY dibuat di Firebase.")
             log("=" * 58)
@@ -476,6 +535,7 @@ def monitor_ambulance_sessions(
 # ============================================================
 # KOMUNIKASI SERIAL JSONL
 # ============================================================
+
 
 def read_serial_line(connection: serial.Serial) -> str | None:
     raw_line = connection.readline()
@@ -495,7 +555,6 @@ def send_serial_command(
     group: str | None = None,
 ) -> dict[str, Any]:
     """Kirim satu perintah dan tunggu ACK/NAK dengan ID yang sama."""
-
     payload: dict[str, Any] = {
         "cmd": command,
         "id": request_id,
@@ -547,6 +606,7 @@ def send_serial_command(
 # PEMROSESAN PERINTAH FIREBASE
 # ============================================================
 
+
 def reject_firebase_command(
     command_ref: Any,
     response_ref: Any,
@@ -594,8 +654,11 @@ def process_firebase_command(
 
     if command not in ALLOWED_COMMANDS:
         reject_firebase_command(
-            command_ref, response_ref, request_id,
-            command, "UNSUPPORTED_COMMAND"
+            command_ref,
+            response_ref,
+            request_id,
+            command,
+            "UNSUPPORTED_COMMAND",
         )
         return
 
@@ -604,8 +667,11 @@ def process_firebase_command(
         group = str(command_data.get("group", "")).strip().upper()
         if group not in VALID_PRIORITY_GROUPS:
             reject_firebase_command(
-                command_ref, response_ref, request_id,
-                command, "INVALID_OR_MISSING_GROUP"
+                command_ref,
+                response_ref,
+                request_id,
+                command,
+                "INVALID_OR_MISSING_GROUP",
             )
             update_session_simulation(
                 ambulance_sessions_ref,
@@ -649,9 +715,7 @@ def process_firebase_command(
                     priority_ack_at=utc_now_iso(),
                     priority_ack_group=group,
                 )
-                log(
-                    f"[BACKEND] PRIORITY kelompok {group} diterima ESP32."
-                )
+                log(f"[BACKEND] PRIORITY kelompok {group} diterima ESP32.")
 
             elif command == "RELEASE":
                 update_session_simulation(
@@ -778,6 +842,7 @@ def process_firebase_command(
 # PROGRAM UTAMA
 # ============================================================
 
+
 def main() -> None:
     listener = None
     connection: serial.Serial | None = None
@@ -847,6 +912,7 @@ def main() -> None:
             ambulance_scan_interval_seconds=AMBULANCE_SCAN_INTERVAL_SECONDS,
             priority_trigger_distance_m=PRIORITY_TRIGGER_DISTANCE_METERS,
             max_gps_age_seconds=MAX_GPS_DATA_AGE_SECONDS,
+            max_future_clock_skew_seconds=MAX_FUTURE_CLOCK_SKEW_SECONDS,
             message=(
                 "Backend aktif, memantau GPS ambulans, "
                 "dan mengelola PRIORITY/RELEASE."
@@ -862,7 +928,11 @@ def main() -> None:
         log("")
         log("BACKEND AKTIF.")
         log("Pemantauan GPS ambulans aktif.")
-        log("GREEN HOLD akan dilepas saat ARRIVED / sesi selesai / GPS stale.")
+        log(
+            "GREEN HOLD akan dilepas saat ARRIVED / pembatalan / "
+            "sesi selesai / GPS stale."
+        )
+        log("Umur GPS ditampilkan apa adanya (termasuk nilai negatif).")
         log("Menunggu perintah dari Firebase.")
         log("Tekan CTRL+C untuk menghentikan.")
         log("")
@@ -881,7 +951,7 @@ def main() -> None:
                     time.monotonic() + AMBULANCE_SCAN_INTERVAL_SECONDS
                 )
 
-            # Dahulukan perintah dari Firebase / hasil pemantauan GPS.
+            # Dahulukan perintah Firebase / hasil pemantauan GPS.
             try:
                 request_id, command_data = command_queue.get_nowait()
             except queue.Empty:
@@ -953,7 +1023,9 @@ def main() -> None:
 
     except serial.SerialException as error:
         log(f"[SERIAL] Gagal menggunakan {SERIAL_PORT}: {error}")
-        log("Pastikan ESP32 terhubung dan Serial Monitor Arduino IDE ditutup.")
+        log(
+            "Pastikan ESP32 terhubung dan Serial Monitor Arduino IDE ditutup."
+        )
 
     except Exception as error:
         log(f"[BACKEND] Terjadi kesalahan: {error}")
