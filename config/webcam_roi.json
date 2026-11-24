@@ -1,0 +1,38 @@
+{
+    "camera_index": 0,
+    "capture_width": 1280,
+    "capture_height": 720,
+    "stream_url": "https://dki-jkt.balitower.co.id:7028/502160_JKP_POLDA_JL.-GERBANG-PEMUDA-C03_CCTV-02/index.m3u8",
+    "model_path": "model_validation/models/best.pt",
+    "firebase_service_account": "C:/STL-credentials/firebase-admin-key.json",
+    "firebase_database_url": "https://smart-traffic-light-rawa-d711e-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "confidence_threshold": 0.25,
+    "iou_threshold": 0.45,
+    "image_size": 640,
+    "device": null,
+    "publish_interval_seconds": 1.0,
+    "show_preview": true,
+    "roi_webcam": [],
+    "roi_cctv": [
+        [
+            0.025039123630672927,
+            0.415041782729805
+        ],
+        [
+            0.405320813771518,
+            0.924791086350975
+        ],
+        [
+            0.7527386541471048,
+            0.14206128133704735
+        ],
+        [
+            0.5868544600938967,
+            0.04735376044568245
+        ],
+        [
+            0.3364632237871675,
+            0.15041782729805014
+        ]
+    ]
+}
