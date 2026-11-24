@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +17,10 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 from services.webcam_detector import WebcamDetector
+from services.density_config import (
+    classify_density,
+    normalize_density_config,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -275,6 +280,23 @@ def main():
         print(f"ROI tersimpan untuk sumber ini: {len(active_roi)} titik")
 
         firebase_ref = initialize_firebase(config)
+
+        # One shared threshold config for webcam, CCTV, photo and video analyses.
+        density_config_ref = db.reference("/analysis_config/density")
+        try:
+            density_config = normalize_density_config(density_config_ref.get())
+        except Exception as density_error:
+            print("Konfigurasi kepadatan belum dapat dibaca; memakai default 5/15:", density_error)
+            density_config = normalize_density_config(None)
+        density_samples = deque(maxlen=5)
+        last_density_config_refresh = time.monotonic()
+        print(
+            "Ambang kepadatan aktif: "
+            f"Rendah 0-{density_config['low_max']}, "
+            f"Sedang {density_config['low_max'] + 1}-{density_config['medium_max']}, "
+            f"Tinggi > {density_config['medium_max']}"
+        )
+
         publish_status(
             firebase_ref,
             "starting",
@@ -421,6 +443,26 @@ def main():
             if not roi_editor["active"] and now - last_publish >= publish_interval:
                 counts = analysis["counts"]
                 roi_configured = len(detector.roi_points) >= 3
+                current_count = int(analysis["total_vehicles"])
+
+                # Pick up settings changes made from Android without restarting Python.
+                if now - last_density_config_refresh >= 5.0:
+                    try:
+                        density_config = normalize_density_config(density_config_ref.get())
+                    except Exception as density_error:
+                        print("Gagal memperbarui konfigurasi kepadatan; memakai konfigurasi terakhir:", density_error)
+                    last_density_config_refresh = now
+
+                # Use the last five published counts to reduce frame-to-frame flicker.
+                if roi_configured:
+                    density_samples.append(current_count)
+                    density_count = int(round(sum(density_samples) / len(density_samples)))
+                    density_label = classify_density(density_count, density_config)
+                else:
+                    density_count = 0
+                    density_label = "Belum diklasifikasikan"
+                    density_samples.clear()
+
                 payload = {
                     "source": "laptop_webcam" if source_type == "webcam" else "public_cctv",
                     "source_type": source_type,
@@ -431,7 +473,15 @@ def main():
                     "timestamp": int(time.time()),
                     "roi_configured": roi_configured,
                     "counts": counts,
-                    "total_vehicles": analysis["total_vehicles"],
+                    "total_vehicles": current_count,
+                    "density_count_average": density_count,
+                    "density_label": density_label,
+                    "density_enabled": density_config["enabled"],
+                    "density_thresholds": {
+                        "low_max": density_config["low_max"],
+                        "medium_max": density_config["medium_max"],
+                    },
+                    "density_sample_count": len(density_samples),
                     "frame": {
                         "width": int(width),
                         "height": int(height),
@@ -448,7 +498,8 @@ def main():
                         f"Motor={counts['motorcycle']} | "
                         f"Bus={counts['bus']} | "
                         f"Truk={counts['truck']} | "
-                        f"Total={analysis['total_vehicles']}"
+                        f"Total={current_count} | "
+                        f"Rata-rata={density_count} | Kepadatan={density_label}"
                     )
                 except Exception as firebase_error:
                     print("Gagal mengirim data Firebase:", firebase_error)
@@ -475,6 +526,7 @@ def main():
                     save_config(config)
                     detector.roi_points = [point[:] for point in new_points]
                     active_roi = [point[:] for point in new_points]
+                    density_samples.clear()
                     roi_editor["active"] = False
                     roi_editor["points"] = []
                     last_publish = 0.0
